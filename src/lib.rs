@@ -13,3 +13,6 @@ pub mod webhook;
 
 #[cfg(feature = "products")]
 pub mod products;
+
+#[cfg(feature = "ai-gateway")]
+pub mod ai_gateway;
