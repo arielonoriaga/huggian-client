@@ -120,9 +120,29 @@ impl Subscription {
 /// What `POST /v1/payments/checkout` answered.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct CheckoutResponse {
+    /// The checkout id core assigned. Absent when core declined to mint a link.
+    pub id: Option<String>,
     #[serde(rename = "checkoutUrl")]
     pub checkout_url: Option<String>,
     pub reason: Option<String>,
+}
+
+/// A checkout answer together with the id core gave it. Products that reconcile
+/// payments by that id (ez-commerce's webhook does) need it; the plain
+/// [`CheckoutOutcome`] does not carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutResult {
+    pub id: Option<String>,
+    pub outcome: CheckoutOutcome,
+}
+
+impl From<CheckoutResponse> for CheckoutResult {
+    fn from(r: CheckoutResponse) -> Self {
+        Self {
+            id: r.id.clone(),
+            outcome: r.into(),
+        }
+    }
 }
 
 /// The result of asking for a payment link. A declined checkout is a normal
@@ -242,6 +262,7 @@ mod tests {
     fn checkout_outcome_maps_url_and_every_known_reason() {
         let r = |u: Option<&str>, reason: Option<&str>| {
             CheckoutOutcome::from(CheckoutResponse {
+                id: None,
                 checkout_url: u.map(str::to_string),
                 reason: reason.map(str::to_string),
             })
@@ -267,5 +288,20 @@ mod tests {
             r(None, None),
             CheckoutOutcome::Declined(CheckoutDeclined::Other("no_checkout_url".into()))
         );
+    }
+    #[test]
+    fn checkout_result_carries_the_id_core_assigned_next_to_the_outcome() {
+        let with_url: CheckoutResponse = serde_json::from_value(json!({"id":"chk_1","checkoutUrl":"https://mp/x"})).unwrap();
+        assert_eq!(
+            CheckoutResult::from(with_url),
+            CheckoutResult { id: Some("chk_1".into()), outcome: CheckoutOutcome::Url("https://mp/x".into()) }
+        );
+        let declined: CheckoutResponse = serde_json::from_value(json!({"id":null,"checkoutUrl":null,"reason":"checkout_already_pending"})).unwrap();
+        assert_eq!(
+            CheckoutResult::from(declined),
+            CheckoutResult { id: None, outcome: CheckoutOutcome::Declined(CheckoutDeclined::AlreadyPending) }
+        );
+        let no_id_key: CheckoutResponse = serde_json::from_value(json!({"checkoutUrl":"https://mp/y"})).unwrap();
+        assert_eq!(CheckoutResult::from(no_id_key).id, None, "an absent id key is None, not an error");
     }
 }

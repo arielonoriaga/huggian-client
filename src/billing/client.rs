@@ -12,7 +12,7 @@ use reqwest::{RequestBuilder, Response, StatusCode, Url};
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::error::BillingError;
-use super::types::{CheckoutOutcome, CheckoutResponse, Customer, Plan, Subscription};
+use super::types::{CheckoutOutcome, CheckoutResponse, CheckoutResult, Customer, Plan, Subscription};
 
 /// Reads that sit on the request path of a gated call get a tight ceiling so a
 /// cold cache cannot hold a request for the shared client's full timeout.
@@ -188,6 +188,22 @@ impl BillingClient {
         back_url: &str,
         success_url: Option<&str>,
     ) -> Result<CheckoutOutcome, BillingError> {
+        Ok(self
+            .initiate_checkout_detailed(subscription_id, provider, customer_email, back_url, success_url)
+            .await?
+            .outcome)
+    }
+
+    /// Like [`initiate_checkout`](Self::initiate_checkout), but also returns the
+    /// checkout id core assigned (`None` when it declined to mint a link).
+    pub async fn initiate_checkout_detailed(
+        &self,
+        subscription_id: &str,
+        provider: &str,
+        customer_email: &str,
+        back_url: &str,
+        success_url: Option<&str>,
+    ) -> Result<CheckoutResult, BillingError> {
         let url = self.url(&["v1", "payments", "checkout"])?;
         let body = Checkout {
             subscription_id,
@@ -407,6 +423,25 @@ mod tests {
             .await;
         let out = client(&server).initiate_checkout("s1", "mercadopago", "", "/plan", None).await.unwrap();
         assert_eq!(out, CheckoutOutcome::Declined(super::super::types::CheckoutDeclined::AlreadyPending));
+    }
+
+    #[tokio::test]
+    async fn detailed_checkout_returns_the_id_next_to_the_url_and_none_when_declined() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1/payments/checkout"))
+            .and(body_json(json!({"subscriptionId":"s1","provider":"mercadopago","customerEmail":"a@b.c","backUrl":"/plan"})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":"chk_9","checkoutUrl":"https://mp/init"})))
+            .up_to_n_times(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/v1/payments/checkout"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":null,"checkoutUrl":null,"reason":"provider_unreachable"})))
+            .mount(&server).await;
+
+        let c = client(&server);
+        let ok = c.initiate_checkout_detailed("s1", "mercadopago", "a@b.c", "/plan", None).await.unwrap();
+        assert_eq!(ok, CheckoutResult { id: Some("chk_9".into()), outcome: CheckoutOutcome::Url("https://mp/init".into()) });
+        let declined = c.initiate_checkout_detailed("s1", "mercadopago", "a@b.c", "/plan", None).await.unwrap();
+        assert_eq!(declined.id, None);
+        assert_eq!(declined.outcome, CheckoutOutcome::Declined(super::super::types::CheckoutDeclined::ProviderUnreachable));
     }
 
     #[tokio::test]
