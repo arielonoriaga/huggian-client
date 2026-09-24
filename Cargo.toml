@@ -1,6 +1,6 @@
 [package]
 name = "huggian-client"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "Shared client + webhook primitives for huggian-core integrations."
@@ -22,6 +22,15 @@ products = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json", "dep:uuid
 # a consumer's own provider-abstraction trait and env-var resolution stay
 # in that consumer's own code.
 ai-gateway = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json", "dep:rand", "dep:thiserror"]
+# The single home of the per-product subscription flow (trial → checkout →
+# cancel): Huggian billing client, pure subscription-state rules, trial
+# provisioning and a per-company state cache. Products (ez-addon's cochera,
+# later ez-commerce) supply only their plan slug, trial length and identity.
+billing = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json", "dep:uuid", "dep:thiserror", "dep:chrono"]
+# Optional axum 0.7 router over `billing` (GET /subscription, GET /plans,
+# POST /checkout, POST /cancel). Authentication stays the product's: it
+# implements `IdentitySource`. axum 0.7 on purpose — both consumers are on it.
+billing-axum = ["billing", "dep:axum"]
 
 [dependencies]
 hmac = "0.12"
@@ -34,8 +43,11 @@ serde_json = { version = "1", optional = true }
 uuid = { version = "1", features = ["serde"], optional = true }
 rand = { version = "0.8", optional = true }
 thiserror = { version = "2", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"], optional = true }
+axum = { version = "0.7", default-features = false, features = ["json"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 wiremock = "0.6"
 serde_json = "1"
+tower = { version = "0.5", features = ["util"] }
