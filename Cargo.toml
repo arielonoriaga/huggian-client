@@ -51,3 +51,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-
 wiremock = "0.6"
 serde_json = "1"
 tower = { version = "0.5", features = ["util"] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
