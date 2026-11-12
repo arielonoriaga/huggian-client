@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::timeout;
 
-use super::{parse_error_code, parse_error_message, AiErrorCode, AiGatewayError, HuggianAiClient, Usage, UsageWire};
+use super::{parse_error_code, AiErrorCode, AiGatewayError, HuggianAiClient, Usage, UsageWire};
 
 const EXTRACT_PATH: &str = "/api/ai/extract-document";
 
@@ -154,7 +154,15 @@ impl HuggianAiClient {
 
         let status = resp.status().as_u16();
         if resp.status().is_success() {
-            return resp.json::<Value>().await.map_err(|e| AiGatewayError::Transport(e.to_string()));
+            // A 200 whose body is not JSON (a proxy page) is a content problem,
+            // not downtime; only a failure to read the body is transport.
+            return resp.json::<Value>().await.map_err(|e| {
+                if e.is_decode() {
+                    AiGatewayError::Deserialization(e.to_string())
+                } else {
+                    AiGatewayError::Transport(e.to_string())
+                }
+            });
         }
         let text = resp.text().await.unwrap_or_default();
         let code = parse_error_code(&text);
@@ -164,7 +172,7 @@ impl HuggianAiClient {
             (503, AiErrorCode::DailyCapReached) => AiGatewayError::DailyCapReached,
             (503, AiErrorCode::Busy) => AiGatewayError::Busy,
             (503, AiErrorCode::ProviderMisconfigured) => {
-                AiGatewayError::ProviderMisconfigured(parse_error_message(&text).unwrap_or_default())
+                AiGatewayError::ProviderMisconfigured(String::new())
             }
             (503, _) => AiGatewayError::NoProvider,
             (504, _) => AiGatewayError::ExtractionTimeout,
@@ -280,7 +288,7 @@ mod tests {
             ("invalid_output", StopReason::InvalidOutput),
         ] {
             let server = server_with(200, json!({
-                "ok": true, "data": null, "stop_reason": wire, "model": "claude-opus-5-5",
+                "ok": true, "data": { "x": 1 }, "stop_reason": wire, "model": "claude-opus-5-5",
                 "usage": { "input_tokens": 10, "output_tokens": 5 }, "cost_usd": null, "request_id": "r"
             }))
             .await;
@@ -401,8 +409,15 @@ mod tests {
     async fn errors_and_request_debug_never_carry_document_content() {
         // A misbehaving upstream that echoes the document back must not get it
         // into our error values.
-        for status in [400u16, 401, 403, 502] {
-            let server = server_with(status, json!({ "error_code": "upstream_error", "error": format!("echo {DOC}") })).await;
+        let echo = format!("echo {DOC}");
+        for (status, body) in [
+            (400u16, json!({ "error_code": "upstream_error", "error": echo })),
+            (401, json!({ "error_code": "upstream_error", "error": echo })),
+            (403, json!({ "error_code": "upstream_error", "error": echo })),
+            (502, json!({ "error_code": "upstream_error", "error": echo })),
+            (503, json!({ "error_code": "provider_misconfigured", "error": echo })),
+        ] {
+            let server = server_with(status, body).await;
             let err = call(&ai(server.uri(), 3)).await.unwrap_err();
             assert!(!format!("{err} {err:?}").contains(DOC), "{status} leaked the document");
         }
@@ -453,5 +468,63 @@ mod tests {
         .await;
         let err = call(&ai(server.uri(), 3)).await.unwrap_err();
         assert!(matches!(err, AiGatewayError::Deserialization(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_200_body_never_opens_the_breaker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>gateway page</html>"))
+            .mount(&server)
+            .await;
+        let client = ai(server.uri(), 3);
+        for _ in 0..6 {
+            let err = call(&client).await.unwrap_err();
+            assert!(matches!(err, AiGatewayError::Deserialization(_)), "{err:?}");
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_half_open_probe_hands_the_next_call_the_probe() {
+        let server = server_with(503, json!({ "error_code": "no_provider" })).await;
+        let client = HuggianAiClient::new(
+            reqwest::Client::new(),
+            HuggianAiConfig {
+                base_url: server.uri(),
+                service_token: "t".to_string(),
+                timeout: Duration::from_secs(5),
+                max_retries: 0,
+                breaker_threshold: 3,
+                breaker_cooldown: Duration::from_millis(200),
+            },
+            4,
+        );
+        for _ in 0..3 {
+            let _ = call(&client).await;
+        }
+        assert!(matches!(call(&client).await.unwrap_err(), AiGatewayError::CircuitOpen { .. }));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The half-open probe hangs and the caller gives up.
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
+            .mount(&server)
+            .await;
+        let _ = tokio::time::timeout(Duration::from_millis(100), call(&client)).await;
+
+        // Provider health is still unknown: the next call must be the probe
+        // (reaches the network), and when it fails the breaker re-opens at
+        // once. A breaker that had wrongly closed would let the call after
+        // that through too.
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({ "error_code": "no_provider" })))
+            .mount(&server)
+            .await;
+        assert!(matches!(call(&client).await.unwrap_err(), AiGatewayError::NoProvider));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "next call became the probe");
+        assert!(matches!(call(&client).await.unwrap_err(), AiGatewayError::CircuitOpen { .. }));
     }
 }

@@ -412,15 +412,15 @@ impl CircuitBreaker {
 ///
 /// Extraction opts into a lenient mode ([`CallGuard::abandon_is_not_an_outage`]):
 /// a caller giving up on a long document says nothing about provider health,
-/// so an abandoned call there releases a half-open probe without adding to
-/// the failure streak. The default stays strict.
+/// so an abandoned call there never adds to the failure streak, and an
+/// abandoned half-open probe hands the probe to the next call. The default stays strict.
 #[must_use = "an admitted call must be settled or the breaker records it as abandoned"]
 struct CallGuard<'a> {
     breaker: &'a CircuitBreaker,
     settled: bool,
-    /// When true (extraction), a guard dropped unsettled is recorded as a
-    /// non-availability outcome: it still releases a half-open probe (back to
-    /// Closed) but never adds to the failure streak.
+    /// When true (extraction), a guard dropped unsettled never adds to the
+    /// failure streak; an abandoned half-open probe re-opens the breaker with
+    /// the cooldown already elapsed, so the next call becomes the probe.
     lenient_abandon: bool,
 }
 
@@ -443,12 +443,22 @@ impl Drop for CallGuard<'_> {
         if self.settled {
             return;
         }
-        let outcome = if self.lenient_abandon {
-            AiGatewayError::Deserialization("call abandoned before completion".to_string())
-        } else {
-            AiGatewayError::Transport("call abandoned before completion (cancelled or panicked)".to_string())
-        };
-        self.breaker.after_call(&Err(outcome));
+        if self.lenient_abandon {
+            // The caller gave up: that says nothing about provider health, so
+            // never add to the failure streak. An abandoned half-open probe
+            // must not close the breaker either (health is still unknown) —
+            // re-open it with the cooldown already elapsed so the next call
+            // becomes the probe.
+            let mut s = self.breaker.lock();
+            if s.phase == BreakerPhase::HalfOpen {
+                s.phase = BreakerPhase::Open;
+                s.open_until = Instant::now();
+            }
+            return;
+        }
+        self.breaker.after_call(&Err(AiGatewayError::Transport(
+            "call abandoned before completion (cancelled or panicked)".to_string(),
+        )));
     }
 }
 
