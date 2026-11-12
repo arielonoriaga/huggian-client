@@ -1,5 +1,6 @@
 //! Retrying, circuit-breaking HTTP client for huggian-core's AI gateway
-//! (`POST /api/ai/complete`, `POST /api/ai/complete-structured`).
+//! (`POST /api/ai/complete`, `POST /api/ai/complete-structured`,
+//! `POST /api/ai/extract-document`).
 //!
 //! Ported verbatim from ez-addon's `infrastructure::ai_gateway::huggian`
 //! module (see that repo's docs/phase4-ai.md) so every consumer of
@@ -20,6 +21,9 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, Instant};
+
+mod extract;
+pub use extract::{DocumentAttachment, ExtractRequest, Extraction, StopReason};
 
 /// Best-effort parse of `error_code` from huggian's standard error JSON
 /// shape `{ "error": "...", "error_code": "...", "request_id": "..." }`.
@@ -351,7 +355,7 @@ impl CircuitBreaker {
     }
 
     fn admit(&self) -> CallGuard<'_> {
-        CallGuard { breaker: self, settled: false }
+        CallGuard { breaker: self, settled: false, lenient_abandon: false }
     }
 
     /// Called once with the outcome of a call `before_call` admitted.
@@ -405,10 +409,26 @@ impl CircuitBreaker {
 /// call, so the gateway stays dead for the life of the process, with zero HTTP
 /// requests and no path back. Recording the abandoned probe as a failure sends
 /// it to `Open` with a fresh cooldown instead, so it self-heals.
+///
+/// Extraction opts into a lenient mode ([`CallGuard::abandon_is_not_an_outage`]):
+/// a caller giving up on a long document says nothing about provider health,
+/// so an abandoned call there releases a half-open probe without adding to
+/// the failure streak. The default stays strict.
 #[must_use = "an admitted call must be settled or the breaker records it as abandoned"]
 struct CallGuard<'a> {
     breaker: &'a CircuitBreaker,
     settled: bool,
+    /// When true (extraction), a guard dropped unsettled is recorded as a
+    /// non-availability outcome: it still releases a half-open probe (back to
+    /// Closed) but never adds to the failure streak.
+    lenient_abandon: bool,
+}
+
+impl CallGuard<'_> {
+    fn abandon_is_not_an_outage(mut self) -> Self {
+        self.lenient_abandon = true;
+        self
+    }
 }
 
 impl CallGuard<'_> {
@@ -420,11 +440,15 @@ impl CallGuard<'_> {
 
 impl Drop for CallGuard<'_> {
     fn drop(&mut self) {
-        if !self.settled {
-            self.breaker.after_call(&Err(AiGatewayError::Transport(
-                "call abandoned before completion (cancelled or panicked)".to_string(),
-            )));
+        if self.settled {
+            return;
         }
+        let outcome = if self.lenient_abandon {
+            AiGatewayError::Deserialization("call abandoned before completion".to_string())
+        } else {
+            AiGatewayError::Transport("call abandoned before completion (cancelled or panicked)".to_string())
+        };
+        self.breaker.after_call(&Err(outcome));
     }
 }
 
