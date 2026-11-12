@@ -18,6 +18,18 @@
 //! `/api/ai/extract-document`) and the extraction route's error codes.
 //! Breaking: `AiErrorCode` and `AiGatewayError` gained variants, so
 //! exhaustive matches in consumers must add arms.
+//!
+//! Build a dedicated `HuggianAiClient` for extraction (own token, breaker and
+//! bulkhead): sharing one with chat lets long extractions hold chat's slots.
+//! `Extraction::cost_usd` is the gateway's estimate for display/alerting
+//! only; never feed it into a money ledger.
+//!
+//! v0.5.1 hardens extraction: the request timeout derives from the gateway's
+//! (`timeout_ms` + 10 s), client-side timeouts are content outcomes
+//! (`ExtractionTimeout`, never counted by the breaker), requests are validated
+//! locally (new `AiGatewayError::InvalidRequest` — v0.5.0 had no adopters, so
+//! the added variant ships in a patch release), and `Extraction`'s `Debug`
+//! redacts `data`.
 
 #[cfg(feature = "webhook")]
 pub mod webhook;

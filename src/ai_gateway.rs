@@ -142,6 +142,11 @@ pub enum AiGatewayError {
     /// a content outcome for this client's breaker, unlike `UpstreamTimeout`.
     #[error("document extraction timed out (504)")]
     ExtractionTimeout,
+    /// `/extract-document` only: the request broke a gateway limit
+    /// (attachment count, `max_tokens`, `timeout_ms`) and was refused locally
+    /// with zero HTTP requests. A caller bug, not a downtime signal.
+    #[error("invalid extraction request: {0}")]
+    InvalidRequest(&'static str),
     #[error("upstream error {status} [{code}]: {body}")]
     Upstream {
         status: u16,
@@ -189,7 +194,9 @@ impl AiGatewayError {
             // indistinguishable from a live upstream failure in every log
             // and metric.
             AiGatewayError::CircuitOpen { last } => *last,
-            AiGatewayError::Transport(_) | AiGatewayError::Deserialization(_) => AiErrorCode::Unknown,
+            AiGatewayError::Transport(_)
+            | AiGatewayError::Deserialization(_)
+            | AiGatewayError::InvalidRequest(_) => AiErrorCode::Unknown,
         }
     }
 }
@@ -235,7 +242,7 @@ pub struct HuggianAiConfig {
 /// body we couldn't use — a formatting problem, not a downtime signal —
 /// tripping the breaker on those would take a reachable gateway offline
 /// over bad output. The extraction-only variants (`InputRejected`,
-/// `DailyCapReached`, `Busy`, `ExtractionTimeout`) are refusals or content
+/// `DailyCapReached`, `Busy`, `ExtractionTimeout`, `InvalidRequest`) are refusals or content
 /// outcomes, never downtime. `CircuitOpen` never reaches this classifier: the
 /// breaker short-circuits before a call is made, so there's no outcome to
 /// record.
@@ -263,6 +270,7 @@ fn is_availability_failure(e: &AiGatewayError) -> bool {
         | AiGatewayError::DailyCapReached
         | AiGatewayError::Busy
         | AiGatewayError::ExtractionTimeout
+        | AiGatewayError::InvalidRequest(_)
         | AiGatewayError::Deserialization(_)
         | AiGatewayError::CircuitOpen { .. } => false,
     }
@@ -1113,6 +1121,7 @@ mod tests {
             AiGatewayError::DailyCapReached,
             AiGatewayError::Busy,
             AiGatewayError::ExtractionTimeout,
+            AiGatewayError::InvalidRequest("x"),
         ] {
             assert!(!is_availability_failure(&e), "{e:?} must not count toward the breaker");
         }
