@@ -43,8 +43,9 @@ fn parse_error_message(body: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Mirrors the closed `AIErrorCode` enum emitted by huggian's AI gateway
-/// in the `error_code` JSON field. See
+/// Mirrors the subset of the closed `AIErrorCode` enum emitted by huggian's
+/// AI gateway in the `error_code` JSON field that a client error can carry,
+/// including the extraction-route codes. See
 /// huggian-management/services/core/src/contexts/ai/domain/types.ts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiErrorCode {
@@ -55,6 +56,11 @@ pub enum AiErrorCode {
     RateLimit,
     InvalidJson,
     InvalidToken,
+    RouteNotAllowed,
+    InputRejected,
+    DailyCapReached,
+    ModelNotAllowed,
+    Busy,
     Unknown,
 }
 
@@ -74,6 +80,11 @@ impl AiErrorCode {
             "rate_limit" => Self::RateLimit,
             "invalid_json" => Self::InvalidJson,
             "invalid_token" => Self::InvalidToken,
+            "route_not_allowed" => Self::RouteNotAllowed,
+            "input_rejected" => Self::InputRejected,
+            "daily_cap_reached" => Self::DailyCapReached,
+            "model_not_allowed" => Self::ModelNotAllowed,
+            "busy" => Self::Busy,
             _ => Self::Unknown,
         }
     }
@@ -87,6 +98,11 @@ impl AiErrorCode {
             Self::RateLimit => "rate_limit",
             Self::InvalidJson => "invalid_json",
             Self::InvalidToken => "invalid_token",
+            Self::RouteNotAllowed => "route_not_allowed",
+            Self::InputRejected => "input_rejected",
+            Self::DailyCapReached => "daily_cap_reached",
+            Self::ModelNotAllowed => "model_not_allowed",
+            Self::Busy => "busy",
             Self::Unknown => "unknown",
         }
     }
@@ -104,6 +120,24 @@ pub enum AiGatewayError {
     UpstreamTimeout,
     #[error("invalid json from provider (422)")]
     InvalidJson,
+    /// `/extract-document` only: the gateway (413, body too large) or the AI
+    /// provider (422, `upstream_status` = provider HTTP status) refused this
+    /// document. Not billed; not a downtime signal.
+    #[error("document rejected ({status}, provider status {upstream_status:?})")]
+    InputRejected { status: u16, upstream_status: Option<u16> },
+    /// `/extract-document` only: the platform-wide daily USD cap is reached,
+    /// or the cap is unset/0 (route off). Not a downtime signal.
+    #[error("extraction daily cap reached (503)")]
+    DailyCapReached,
+    /// `/extract-document` only: the gateway's in-process concurrency limit
+    /// is full. Local capacity, not a downtime signal.
+    #[error("extraction gateway busy (503)")]
+    Busy,
+    /// `/extract-document` only: the gateway timed the extraction out (504).
+    /// Usually a long document, and the call may have been billed — so it is
+    /// a content outcome for this client's breaker, unlike `UpstreamTimeout`.
+    #[error("document extraction timed out (504)")]
+    ExtractionTimeout,
     #[error("upstream error {status} [{code}]: {body}")]
     Upstream {
         status: u16,
@@ -138,6 +172,10 @@ impl AiGatewayError {
             AiGatewayError::RateLimited => AiErrorCode::RateLimit,
             AiGatewayError::UpstreamTimeout => AiErrorCode::UpstreamTimeout,
             AiGatewayError::InvalidJson => AiErrorCode::InvalidJson,
+            AiGatewayError::InputRejected { .. } => AiErrorCode::InputRejected,
+            AiGatewayError::DailyCapReached => AiErrorCode::DailyCapReached,
+            AiGatewayError::Busy => AiErrorCode::Busy,
+            AiGatewayError::ExtractionTimeout => AiErrorCode::UpstreamTimeout,
             AiGatewayError::Upstream { code, .. } => *code,
             // Report the failure that OPENED the breaker, so usage rows and
             // the degradation path stay semantically identical to the call
@@ -192,7 +230,9 @@ pub struct HuggianAiConfig {
 /// `Deserialization` are the model/gateway answering successfully with a
 /// body we couldn't use — a formatting problem, not a downtime signal —
 /// tripping the breaker on those would take a reachable gateway offline
-/// over bad output. `CircuitOpen` never reaches this classifier: the
+/// over bad output. The extraction-only variants (`InputRejected`,
+/// `DailyCapReached`, `Busy`, `ExtractionTimeout`) are refusals or content
+/// outcomes, never downtime. `CircuitOpen` never reaches this classifier: the
 /// breaker short-circuits before a call is made, so there's no outcome to
 /// record.
 ///
@@ -215,6 +255,10 @@ fn is_availability_failure(e: &AiGatewayError) -> bool {
         | AiGatewayError::Transport(_) => true,
         AiGatewayError::Upstream { status, .. } => (500..600).contains(status),
         AiGatewayError::InvalidJson
+        | AiGatewayError::InputRejected { .. }
+        | AiGatewayError::DailyCapReached
+        | AiGatewayError::Busy
+        | AiGatewayError::ExtractionTimeout
         | AiGatewayError::Deserialization(_)
         | AiGatewayError::CircuitOpen { .. } => false,
     }
@@ -1015,5 +1059,39 @@ mod tests {
         let requests = server.received_requests().await.unwrap().len();
         assert_eq!(requests, 5, "breaker should cap total requests at the threshold, got {requests}");
         assert!(requests < 400, "pre-fix behaviour: 100 items * (max_retries+1) = 400 requests; got {requests}");
+    }
+
+    // --- Error taxonomy (extraction route codes) -----------------------------
+
+    #[test]
+    fn new_gateway_codes_round_trip() {
+        for s in ["route_not_allowed", "input_rejected", "daily_cap_reached", "model_not_allowed", "busy"] {
+            let code = AiErrorCode::parse(s);
+            assert_ne!(code, AiErrorCode::Unknown, "{s} must be a known code");
+            assert_eq!(code.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn extraction_refusals_are_not_availability_failures() {
+        for e in [
+            AiGatewayError::InputRejected { status: 422, upstream_status: Some(400) },
+            AiGatewayError::DailyCapReached,
+            AiGatewayError::Busy,
+            AiGatewayError::ExtractionTimeout,
+        ] {
+            assert!(!is_availability_failure(&e), "{e:?} must not count toward the breaker");
+        }
+    }
+
+    #[test]
+    fn extraction_errors_report_their_codes() {
+        assert_eq!(
+            AiGatewayError::InputRejected { status: 413, upstream_status: None }.code(),
+            AiErrorCode::InputRejected
+        );
+        assert_eq!(AiGatewayError::DailyCapReached.code(), AiErrorCode::DailyCapReached);
+        assert_eq!(AiGatewayError::Busy.code(), AiErrorCode::Busy);
+        assert_eq!(AiGatewayError::ExtractionTimeout.code(), AiErrorCode::UpstreamTimeout);
     }
 }
