@@ -13,6 +13,11 @@
 //! cache). That flow is identical for every product that sells a plan through
 //! Huggian, so it lives here once; what stays product-specific is the plan
 //! slug, the trial length and how a request is tied to a company.
+//!
+//! v0.5 adds `HuggianAiClient::extract_document` (the gateway's
+//! `/api/ai/extract-document`) and the extraction route's error codes.
+//! Breaking: `AiErrorCode` and `AiGatewayError` gained variants, so
+//! exhaustive matches in consumers must add arms.
 
 #[cfg(feature = "webhook")]
 pub mod webhook;
