@@ -30,6 +30,11 @@
 //! locally (new `AiGatewayError::InvalidRequest` — v0.5.0 had no adopters, so
 //! the added variant ships in a patch release), and `Extraction`'s `Debug`
 //! redacts `data`.
+//!
+//! v0.5.2 adds `billing::Plan::tier` (core's currency-independent tier, e.g.
+//! `profesional` for both `profesional` and `profesional-usd`). Optional and
+//! defaulted, so an older core still parses; a consumer building `Plan` with a
+//! struct literal must add the field (none did at release).
 
 #[cfg(feature = "webhook")]
 pub mod webhook;

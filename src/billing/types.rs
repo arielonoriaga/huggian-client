@@ -28,6 +28,12 @@ pub struct Plan {
     pub interval: String,
     #[serde(default)]
     pub limits: Vec<PlanLimit>,
+    /// Core's currency-independent tier (`"profesional"`, `"profesional_anual"`).
+    /// `profesional-usd` and `profesional` share one tier, so products should
+    /// resolve entitlements from this, not the slug. `None` on a core that
+    /// predates the field; fall back to the slug then.
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 fn default_interval() -> String {
@@ -223,6 +229,35 @@ mod tests {
         )
         .unwrap();
         assert!(p.limits.is_empty());
+    }
+
+    #[test]
+    fn tier_is_parsed_when_present_and_none_when_absent() {
+        let with: Plan = serde_json::from_value(json!({
+            "id": "p", "name": "N", "slug": "profesional-usd", "priceCents": 1500,
+            "currency": "USD", "tier": "profesional"
+        }))
+        .unwrap();
+        assert_eq!(with.tier.as_deref(), Some("profesional"));
+        assert_eq!(plan(None).tier, None);
+        let null: Plan = serde_json::from_value(json!({
+            "id": "p", "name": "N", "slug": "s", "priceCents": 1, "currency": "ARS", "tier": null
+        }))
+        .unwrap();
+        assert_eq!(null.tier, None);
+    }
+
+    #[test]
+    fn a_subscription_embedded_plan_carries_its_tier() {
+        let eur = sub(json!({"plan": {
+            "id": "p1", "name": "Empresa anual", "slug": "empresa_anual-eur", "priceCents": 1,
+            "currency": "EUR", "interval": "year", "tier": "empresa_anual"
+        }}));
+        assert_eq!(eur.plan.unwrap().tier.as_deref(), Some("empresa_anual"));
+        let old_core = sub(json!({"plan": {
+            "id": "p1", "name": "N", "slug": "s", "priceCents": 1, "currency": "ARS"
+        }}));
+        assert!(old_core.plan.unwrap().tier.is_none());
     }
 
     fn sub(extra: serde_json::Value) -> Subscription {
